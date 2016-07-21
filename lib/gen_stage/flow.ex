@@ -9,6 +9,11 @@ defmodule GenStage.Flow do
   although computations will be executed in parallel using
   multiple `GenStage`s.
 
+  Flow was also designed to work with both bounded (finite)
+  and unbounded (infinite) data. Allowing the data to be
+  partitioned into arbitrary windows which are materialized
+  at different triggers.
+
   As an example, let's implement the classical word counting
   algorithm using flow. The word counting program will receive
   one file and count how many times each word appears in the
@@ -61,10 +66,9 @@ defmodule GenStage.Flow do
   line by line. Once all data is computed, it is sent to the
   process which invoked `Enum.to_list/1`.
 
-  While we gain concurrency by calling `Flow`, many of the
-  benefits in using flow is in the partioning the data. We will
-  discuss the need for data partioning next. Lastly, we will
-  comment on possible optimizations to the example above.
+  While we gain concurrency by using flow, many of the benefits
+  in using flow is in the partioning the data. We will discuss
+  the need for data partioning next.
 
   ## Partitioning
 
@@ -103,6 +107,15 @@ defmodule GenStage.Flow do
 
       M1 - %{"roses" => 1, "are" => 1, "red" => 1}
       M2 - %{"violets" => 1, "are" => 1, "blue" => 1}
+
+  Which is converted to the list (in no particular ordering):
+
+      [{"roses", 1},
+       {"are", 1},
+       {"red", 1},
+       {"violets", 1},
+       {"are", 1},
+       {"blue", 1}]
 
   Although both stages have performed word counting, we have words
   like "are" that appears on both stages. This means we would need
@@ -152,6 +165,14 @@ defmodule GenStage.Flow do
       R1 - %{"roses" => 1, "are" => 2, "red" => 1}
       R2 - %{"violets" => 1, "blue" => 1}
 
+  Which is converted to the list (in no particular ordering):
+
+      [{"roses", 1},
+       {"are", 2},
+       {"red", 1},
+       {"violets", 1},
+       {"blue", 1}]
+
   In a way that each stage has a distinct subset of the data.
   This way, we know we don't need to merge the data later on
   as the word in each stage is guaranteed to be unique.
@@ -167,7 +188,7 @@ defmodule GenStage.Flow do
   the MapReduce programming model which we will briefly discuss
   next.
 
-  ## MapReduce
+  ### MapReduce
 
   The MapReduce programming model forces us to break our computations
   in two stages: map and reduce. The map stage is often quite easy to
@@ -186,14 +207,59 @@ defmodule GenStage.Flow do
   to guarantee each reducer stage has a distinct subset of the data.
 
   Generally speaking, the performance of our flow will be limited
-  by the amount of work we can perform without having a need to
-  look at the whole collection. Both `flat_map/2` and `reduce/3`
-  functions work on item-per-item. Some operations like `each_state/2`
-  and `map_state/2` are applied to whole state in the stage. They
-  are still parallel but must await for the data to be processed.
+  by the amount of work we can perform without having to look at
+  the whole collection. At the moment we call `reduce/3`, it will
+  group the whole data for that particular partition. Operations
+  on the whole data are still parallel but must await until all
+  data is collected. Finally, calling any function from `Enum`
+  in a flow will start its execution and send the computed datasets
+  to the caller process.
 
-  Calling any function from `Enum` in a flow will start its
-  execution and send the computed dataset to the caller process.
+  While this approach works great for bound (finite) data, it
+  is quite limited for unbounded (infinite) data. After all, if
+  the reduce operation needs the whole data to complete, how can
+  it do so if the data never finishes?
+
+  This brings us to the aspects of data completion and data
+  emission which we will discuss next.
+
+  ## Data completion and triggers
+
+  When working with an unbounded stream of data, there is no
+  such thing as data completion. Therefore, when can we consider
+  a reduce function to be "complete"?
+
+  Our best option is to provide triggers that will allow us to
+  check point the processed data so far.
+
+  There are different triggers we can use:
+
+    * Event count triggers - compute state operations every X events
+
+    * Processing time triggers - compute state operations every X seconds
+
+    * Event time triggers - compute state operations based on the times
+      present in the events themselves
+
+    * Punctuation - hand-written triggers based on the data
+
+  Flow supports all triggers above although event time triggers must
+  be explicitly written with the `trigger/3` function. Event count
+  and processing time based tirggers are defined through `trigger_every/4`.
+
+  Once a trigger is emitted, the `reduce` step halts and invokes
+  the remaining steps for that stage, such as `map/2` and `filter/2`
+  as well as `map_state/2` which will receive the whole reduction
+  state. Triggers are also named and the trigger names will be sent
+  as third argument to the function given in `map_state/2` and
+  `each_state/2`.
+
+  Once a trigger is emitted and the remaining steps in the stage are
+  processed, developers have the choice of either reseting the
+  accumulation stage or keeping it as is. The resetting option is
+  useful when you are interested only on intermediate results. Keeping
+  the accumulator is useful when you want to checkpoint the values
+  but still work towards an end result.
 
   ## Long running-flows
 
@@ -270,9 +336,12 @@ defmodule GenStage.Flow do
   Both `new/1` and `partition/2` allows a set of options to configure
   how flows work. In particular, we recommend developers to play with
   the `:min_demand` and `:max_demand` options, which control the amount
-  of data sent between stages.
+  of data sent between stages. The difference between max_demand and
+  min_demand works as the batch size when the producer is full. If the
+  producer has less events than the batch size, its current events are
+  sent.
 
-  If the stages may perform IO computations, we also recommend increasing
+  If stages may perform IO computations, we also recommend increasing
   the number of stages. The default value is `System.schedulers_online/0`,
   which is a good default if the stages are CPU bound, however, if stages
   are waiting on external resources or other processes, increasing the
@@ -321,6 +390,13 @@ defmodule GenStage.Flow do
   """
 
   defstruct producers: nil, options: [], operations: []
+  @type t :: %GenStage.Flow{producers: producers, operations: [operation], options: Keyword.t}
+
+  @typep producers :: nil | {:stages, GenStage.stage} | {:enumerables, Enumerable.t}
+  @typep operation :: {:mapper, atom(), [term()]} |
+                      {:partition, Keyword.t} |
+                      {:map_state, fun()} |
+                      {:reduce, fun(), fun()}
 
   ## Building
 
@@ -329,13 +405,16 @@ defmodule GenStage.Flow do
 
   ## Options
 
-    * `:stages` - the number of stages before partitioning
+  These options configure the stages before partitioning.
+
+    * `:stages` - the number of stages
     * `:buffer_keep` - how the buffer should behave, see `c:GenStage.init/1`
     * `:buffer_size` - how many events to buffer, see `c:GenStage.init/1`
 
   All remaining options are sent during subscription, allowing developers
   to customize `:min_demand`, `:max_demand` and others.
   """
+  @spec new(Keyword.t) :: t
   def new(options \\ []) do
     %GenStage.Flow{options: options}
   end
@@ -354,6 +433,7 @@ defmodule GenStage.Flow do
       |> Flow.from_enumerable()
 
   """
+  @spec from_enumerable(Enumerable.t) :: t
   def from_enumerable(enumerable) do
     new() |> from_enumerables([enumerable])
   end
@@ -367,6 +447,7 @@ defmodule GenStage.Flow do
       Flow.from_enumerable(Flow.new, file)
 
   """
+  @spec from_enumerable(t, Enumerable.t) :: t
   def from_enumerable(flow, enumerable) do
     flow |> from_enumerables([enumerable])
   end
@@ -386,6 +467,7 @@ defmodule GenStage.Flow do
       Flow.from_enumerable(files)
 
   """
+  @spec from_enumerables([Enumerable.t]) :: t
   def from_enumerables(enumerables) do
     new() |> from_enumerables(enumerables)
   end
@@ -400,6 +482,7 @@ defmodule GenStage.Flow do
                File.stream!("some/file3", read_ahead: 100_000)]
       Flow.from_enumerable(Flow.new, files)
   """
+  @spec from_enumerables(t, [Enumerable.t]) :: t
   def from_enumerables(flow, [_ | _] = enumerables) do
     add_producers(flow, {:enumerables, enumerables})
   end
@@ -419,6 +502,7 @@ defmodule GenStage.Flow do
       Flow.from_stage(MyStage)
 
   """
+  @spec from_stage(GenStage.stage) :: t
   def from_stage(stage) do
     new() |> from_stages([stage])
   end
@@ -431,6 +515,7 @@ defmodule GenStage.Flow do
       Flow.from_stage(Flow.new, MyStage)
 
   """
+  @spec from_stage(t, GenStage.stage) :: t
   def from_stage(flow, stage) do
     flow |> from_stages([stage])
   end
@@ -448,6 +533,7 @@ defmodule GenStage.Flow do
       Flow.from_stage(stages)
 
   """
+  @spec from_stages([GenStage.stage]) :: t
   def from_stages(stages) do
     new() |> from_stages(stages)
   end
@@ -461,6 +547,7 @@ defmodule GenStage.Flow do
       Flow.from_stage(Flow.new, stages)
 
   """
+  @spec from_stages(t, [GenStage.stage]) :: t
   def from_stages(flow, [_ | _] = stages) do
     add_producers(flow, {:stages, stages})
   end
@@ -485,10 +572,21 @@ defmodule GenStage.Flow do
       :ok
 
   """
-  def run(flow) do
-    [] = flow |> map_state(fn _, _ -> [] end) |> Enum.to_list()
+  @spec run(t) :: :ok
+  def run(%{operations: operations} = flow) do
+    case inject_to_run(operations) do
+      :map_state ->
+        [] = flow |> map_state(fn _, _ -> [] end) |> Enum.to_list()
+      :reduce ->
+        [] = flow |> reduce(fn -> [] end, fn _, acc -> acc end) |> Enum.to_list()
+    end
     :ok
   end
+
+  defp inject_to_run([{:reduce, _, _} | _]), do: :map_state
+  defp inject_to_run([{:partition, _} | _]), do: :reduce
+  defp inject_to_run([_ | ops]), do: inject_to_run(ops)
+  defp inject_to_run([]), do: :reduce
 
   ## Mappers
 
@@ -506,6 +604,7 @@ defmodule GenStage.Flow do
       :ok
 
   """
+  @spec each(t, (term -> term)) :: t
   def each(flow, each) when is_function(each, 1) do
     add_operation(flow, {:mapper, :each, [each]})
   end
@@ -520,6 +619,7 @@ defmodule GenStage.Flow do
       [2]
 
   """
+  @spec filter(t, (term -> term)) :: t
   def filter(flow, filter) when is_function(filter, 1) do
     add_operation(flow, {:mapper, :filter, [filter]})
   end
@@ -534,6 +634,7 @@ defmodule GenStage.Flow do
       [4]
 
   """
+  @spec filter_map(t, (term -> term), (term -> term)) :: t
   def filter_map(flow, filter, mapper) when is_function(filter, 1) and is_function(mapper, 1) do
     add_operation(flow, {:mapper, :filter_map, [filter, mapper]})
   end
@@ -552,6 +653,7 @@ defmodule GenStage.Flow do
       [2, 2, 4, 4, 6, 6]
 
   """
+  @spec map(t, (term -> term)) :: t
   def map(flow, mapper) when is_function(mapper, 1) do
     add_operation(flow, {:mapper, :map, [mapper]})
   end
@@ -567,6 +669,7 @@ defmodule GenStage.Flow do
       [1, 2, 2, 3, 4, 6]
 
   """
+  @spec flat_map(t, (term -> Enumerable.t)) :: t
   def flat_map(flow, flat_mapper) when is_function(flat_mapper, 1) do
     add_operation(flow, {:mapper, :flat_map, [flat_mapper]})
   end
@@ -581,6 +684,7 @@ defmodule GenStage.Flow do
       [1, 3]
 
   """
+  @spec reject(t, (term -> term)) :: t
   def reject(flow, filter) when is_function(filter, 1) do
     add_operation(flow, {:mapper, :reject, [filter]})
   end
@@ -612,7 +716,10 @@ defmodule GenStage.Flow do
     * `{:elem, pos}` - apply the hash function to the element
       at position `pos` in the given tuple
 
+    * `{:key, key}` - apply the hash function to the key of a given map
+
   """
+  @spec partition(t, Keyword.t) :: t
   def partition(flow, opts \\ []) when is_list(opts) do
     hash =
       case Keyword.get(opts, :hash, &:erlang.phash2/2) do
@@ -621,6 +728,8 @@ defmodule GenStage.Flow do
         {:elem, pos} when pos >= 0 ->
           pos = pos + 1
           &:erlang.phash2(:erlang.element(pos, &1), &2)
+        {:key, key} ->
+          &:erlang.phash2(Map.fetch!(&1, key), &2)
         other ->
           raise ArgumentError, """
           expected :hash to be one of:
@@ -643,7 +752,7 @@ defmodule GenStage.Flow do
   inside each stage.
 
   Once reducing is done, the returned accumulator will be
-  the new state of the stage for the given window.
+  the new state of the stage for the given batch.
 
   ## Examples
 
@@ -660,26 +769,60 @@ defmodule GenStage.Flow do
        {"x", 1}]
 
   """
-  def reduce(flow, acc, reducer) when is_function(reducer, 2) do
-    if is_function(acc, 0) do
-      add_operation(flow, {:reduce, acc, reducer})
+  @spec reduce(t, (() -> acc), (term, acc -> acc)) :: t when acc: term()
+  def reduce(flow, acc_fun, reducer_fun) when is_function(reducer_fun, 2) do
+    if is_function(acc_fun, 0) do
+      add_operation(flow, {:reduce, acc_fun, reducer_fun})
     else
       raise ArgumentError, "GenStage.Flow.reduce/3 expects the accumulator to be given as a function"
     end
   end
 
   @doc """
+  Controls which values should be emitted from now.
+
+  It can either be `:events` (the default)  or the current
+  stage state as `:state`. This step must be called after
+  the reduce operation and it will guarantee the state is
+  a list that can be sent downstream.
+
+  Most commonly, each partition will emit the events it has
+  processed to the next stages. However, sometimes we want
+  to emit counters or other data structures as a result of
+  our computations. In such cases, the `:emit` option can be
+  set to `:state`, to return the `:state` from `reduce/3`
+  or `map_state/2` or even the processed collection as a whole.
+  """
+  def emit(flow, :events) do
+    flow
+  end
+  def emit(flow, :state) do
+    map_state(flow, fn acc, _, _ -> [acc] end)
+  end
+  def emit(_, emit) do
+    raise ArgumentError, "unknown option for emit: #{inspect emit}"
+  end
+
+  @doc """
   Applies the given function over the stage state.
 
-  The stage stage is either a list of all events processed or
-  the value of a previous `reduce/3` computation.
+  This function must be called after `reduce/3`, as it
+  maps over the state directly (or indirectly) returned
+  by `reduce/3`.
 
-  The `mapper` function may have arity 1 or 2:
+  The `mapper` function may have arity 1 or 2 or 3:
 
     * when one, the state is given as argument
-    * when two, the state and the current stage index are given as arguments
+    * when two, the state and the stage indexes are given as arguments.
+      The index is a tuple with the current stage index as first element
+      and the total number of stages for this partition as second
+    * when three, the state and the stage indexes as above are given
+      as well as the trigger name that led for the `reduce/3` to stop.
+      See `trigger/2` for custom triggers. If the producer halts because
+      it does not have more events, the trigger name is `{:producer, :done}`
 
-  The value returned by this function becomes the new stage state.
+  The value returned by this function becomes the new state
+  for the given window/stage pair.
 
   ## Examples
 
@@ -692,16 +835,21 @@ defmodule GenStage.Flow do
       iex> flow = Flow.from_enumerable(["the quick brown fox"]) |> Flow.flat_map(fn word ->
       ...>    String.graphemes(word)
       ...> end)
-      iex> flow = flow |> Flow.partition |> Flow.reduce(fn -> %{} end, &Map.put(&2, &1, true))
-      iex> flow |> Flow.map_state(fn map -> [map_size(map)] end) |> Enum.sum()
+      iex> flow = Flow.partition(flow)
+      iex> flow = Flow.reduce(flow, fn -> %{} end, &Map.put(&2, &1, true))
+      iex> flow |> Flow.map_state(fn map -> map_size(map) end) |> Flow.emit(:state) |> Enum.sum()
       16
 
   """
-  def map_state(flow, mapper) when is_function(mapper, 2) do
+  @spec map_state(t, (term -> term) | (term, term -> term)) :: t
+  def map_state(flow, mapper) when is_function(mapper, 3) do
     add_operation(flow, {:map_state, mapper})
   end
+  def map_state(flow, mapper) when is_function(mapper, 2) do
+    add_operation(flow, {:map_state, fn acc, index, _ -> mapper.(acc, index) end})
+  end
   def map_state(flow, mapper) when is_function(mapper, 1) do
-    add_operation(flow, {:map_state, fn acc, _ -> mapper.(acc) end})
+    add_operation(flow, {:map_state, fn acc, _, _ -> mapper.(acc) end})
   end
 
   @doc """
@@ -727,12 +875,130 @@ defmodule GenStage.Flow do
       :ok
 
   """
+  @spec each_state(t, (term -> term) | (term, term -> term)) :: t
+  def each_state(flow, mapper) when is_function(mapper, 3) do
+    add_operation(flow, {:map_state, fn acc, index, trigger -> mapper.(acc, index, trigger); acc end})
+  end
   def each_state(flow, mapper) when is_function(mapper, 2) do
-    add_operation(flow, {:map_state, fn acc, index -> mapper.(acc, index); acc end})
+    add_operation(flow, {:map_state, fn acc, index, _ -> mapper.(acc, index); acc end})
   end
   def each_state(flow, mapper) when is_function(mapper, 1) do
-    add_operation(flow, {:map_state, fn acc, _index -> mapper.(acc); acc end})
+    add_operation(flow, {:map_state, fn acc, _, _ -> mapper.(acc); acc end})
   end
+
+  @doc """
+  Calculates when to emit a trigger.
+
+  Triggers are set per partition and used to temporarily halt the
+  upcoming `reduce/3` step allowing the next operations in a stage
+  to execute before reducing is resumed.
+
+  Triggers must be set after a call to `partition/2` and before
+  the call to `reduce/3`. `trigger/3` expects the flow as first
+  argument, an accumulator function that returns the accumulator
+  when the partition starts and the trigger function.
+
+  The trigger function receives the current batch of events sent
+  by the producer and its own accumulator and it must return one
+  of the two values:
+
+    * `{:cont, acc}` - the reduce operation should continue as usual.
+       `acc` is the trigger state.
+
+    * `{:trigger, name, pre, operation, pos, acc}` - the reduce operation
+      should consume the events contained in `pre` and then a trigger with
+      name `name` is emitted. The trigger implies `reduce/3` will halt and
+      the following `map/2`, `map_state/2` and so on will be invoked for
+      this partition.
+
+      Once the trigger is processed, `reduce/3` will resume
+      and `operation` is either `:keep`, meaning the reducing accumulator
+      should be kept, or `:reset`, implying a new accumulator should be
+      generated. Afterwards, the remaining `pos` events are processed.
+
+  We recommend looking at the implementation of `trigger_every/4` for
+  `:events` as an example of a custom trigger.
+  """
+  @spec trigger(t, (() -> acc), ([term], acc -> trigger)) :: t
+        when trigger: {:cont, acc} | {:trigger, name, pre, :keep | :reset, pos, acc},
+             name: term(), pre: [event], pos: [event], acc: term(), event: term()
+  def trigger(flow, acc_fun, trigger_fun) do
+    if is_function(acc_fun, 0) do
+      add_operation(flow, {:punctuation, acc_fun, trigger_fun})
+    else
+      raise ArgumentError, "GenStage.Flow.trigger/3 expects the accumulator to be given as a function"
+    end
+  end
+
+  @trigger_operation [:keep, :reset]
+
+  @doc """
+  Emits a trigger every `count` `unit`.
+
+  `count` must be a positive integer and `unit` is one of:
+
+    * `:events` - emits a trigger every `count` events per partition
+
+    * `:microseconds`, `:seconds`, `:minutes`, `:hours` - emits a trigger
+      every `count` second, minute or hour per partition. Notice such
+      times are an estimate and intrinsically innacurate as they are based
+      on the processing time. There is also no guarantee partitions triggers
+      will be aligned as they may trigger at different times. In other
+      words, they are useful for checkpointing but not for partitioning
+      the data into time windows
+
+  The trigger will be named `{:every, count, unit}` and `keep_or_reset`
+  must be one of `:keep` or `:reset` as described in `trigger/2`.
+
+  ## Examples
+
+  Below is an example that checkpoints sums the items from 1 to 100
+  emitting a trigger with the state every 10 items. The extra 5050
+  value at the end is the trigger emitted because processing is done.
+
+      iex> flow = Flow.from_enumerable(1..100)
+      iex> flow = flow |> Flow.partition(stages: 1) |> Flow.trigger_every(10, :events)
+      iex> flow = flow |> Flow.reduce(fn -> 0 end, & &1 + &2)
+      iex> flow |> Flow.emit(:state) |> Enum.sort()
+      [955, 1810, 2565, 3220, 3775, 4230, 4585, 4840, 4995, 5050, 5050]
+
+  Now let's see an example similar to above except we reset the counter
+  on every trigger. At the end, the sum of all values is still 5050:
+
+      iex> flow = Flow.from_enumerable(1..100)
+      iex> flow = flow |> Flow.partition(stages: 1) |> Flow.trigger_every(10, :events, :reset)
+      iex> flow = flow |> Flow.reduce(fn -> 0 end, & &1 + &2)
+      iex> flow |> Flow.emit(:state) |> Enum.sort()
+      [0, 55, 155, 255, 355, 455, 555, 655, 755, 855, 955]
+
+  """
+  def trigger_every(flow, count, unit, keep_or_reset \\ :keep)
+
+  def trigger_every(flow, count, :events, keep_or_reset)
+      when count > 0 and keep_or_reset in @trigger_operation do
+    name = {:every, count, :events}
+
+    trigger(flow, fn -> count end, fn events, acc ->
+      length = length(events)
+      if length(events) >= acc do
+        {pre, pos} = Enum.split(events, acc)
+        {:trigger, name, pre, keep_or_reset, pos, count}
+      else
+        {:cont, acc - length}
+      end
+    end)
+  end
+
+  def trigger_every(flow, count, unit, keep_or_reset)
+      when count > 0 and keep_or_reset in @trigger_operation do
+    add_operation(flow, {:trigger, to_seconds(count, unit), keep_or_reset, {:every, count, unit}})
+  end
+
+  defp to_seconds(count, :microseconds), do: count
+  defp to_seconds(count, :seconds), do: count * 1000
+  defp to_seconds(count, :minutes), do: count * 1000 * 60
+  defp to_seconds(count, :hours), do: count * 1000 * 60 * 60
+  defp to_seconds(_count, unit), do: raise ArgumentError, "unknown unit #{inspect unit}"
 
   @compile {:inline, add_producers: 2, add_operation: 2}
 

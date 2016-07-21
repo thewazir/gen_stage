@@ -189,7 +189,7 @@ defmodule GenStage do
 
   Notifications are useful for out-of-band information, for example,
   to notify consumers the producer has sent all events it had to
-  process or that a new batch/window of events is starting.
+  process or that a new batch of events is starting.
 
   Note the notification system should not be used for broadcasting
   events, for such, consider using `GenStage.BroadcastDispatcher`.
@@ -1105,9 +1105,6 @@ defmodule GenStage do
             receive_stream(monitor_ref, Map.delete(subscriptions, inner_ref))
         end
 
-      {:"$gen_consumer", {_, {^monitor_ref, _}}, {:notification, {:enumerable, enumerable}}} ->
-        {enumerable, {:receive, monitor_ref, subscriptions}}
-
       {:"$gen_consumer", {_, {^monitor_ref, inner_ref}}, {:notification, {:producer, _}}} ->
         case subscriptions do
           %{^inner_ref => tuple} ->
@@ -1117,7 +1114,7 @@ defmodule GenStage do
             receive_stream(monitor_ref, subscriptions)
         end
 
-      # Discard remaining notification as to not pollute the inbox
+      # Discard remaining notifications as to not pollute the inbox
       {:"$gen_consumer", {_, {^monitor_ref, _}}, {:notification, _}} ->
         receive_stream(monitor_ref, subscriptions)
 
@@ -1482,7 +1479,8 @@ defmodule GenStage do
                                  buffer: buffer, dispatcher_mod: dispatcher_mod}) do
     {_, counter, _} = buffer
     consumer_pids = Enum.map(consumers, fn {_, {pid, _}} -> pid end)
-    [{~c(Dispatcher), dispatcher_mod},
+    [{~c(Stage), :producer},
+     {~c(Dispatcher), dispatcher_mod},
      {~c(Consumers), consumer_pids},
      {~c(Buffer size), counter}]
   end
@@ -1492,7 +1490,8 @@ defmodule GenStage do
     {_, counter, _} = buffer
     producer_pids = Enum.map(producers, fn {_, {pid, _, _}} -> pid end)
     consumer_pids = Enum.map(consumers, fn {_, {pid, _}} -> pid end)
-    [{~c(Dispatcher), dispatcher_mod},
+    [{~c(Stage), :producer_consumer},
+     {~c(Dispatcher), dispatcher_mod},
      {~c(Producers), producer_pids},
      {~c(Consumers), consumer_pids},
      {~c(Buffer size), counter}]
@@ -1500,7 +1499,8 @@ defmodule GenStage do
 
   defp format_status_for_stage(%{type: :consumer, producers: producers}) do
     producer_pids = Enum.map(producers, fn {_, {pid, _, _}} -> pid end)
-    [{~c(Producers), producer_pids}]
+    [{~c(Stage), :consumer},
+     {~c(Producers), producer_pids}]
   end
 
   ## Shared helpers
